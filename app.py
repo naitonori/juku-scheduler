@@ -239,15 +239,21 @@ def main():
         st.subheader("テンプレートのダウンロード")
         col1, col2, col3 = st.columns(3)
 
+        def read_csv_with_bom(path: str) -> bytes:
+            """CSVをUTF-8 BOM付きで読み込み（Excel文字化け防止）"""
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            return content.encode("utf-8-sig")
+
         with col1:
-            with open("templates/rooms.csv", "rb") as f:
-                st.download_button("🏫 教室テンプレート", f, "rooms_template.csv", "text/csv")
+            st.download_button("🏫 教室テンプレート", read_csv_with_bom("templates/rooms.csv"),
+                             "rooms_template.csv", "text/csv")
         with col2:
-            with open("templates/teachers.csv", "rb") as f:
-                st.download_button("👨‍🏫 講師テンプレート", f, "teachers_template.csv", "text/csv")
+            st.download_button("👨‍🏫 講師テンプレート", read_csv_with_bom("templates/teachers.csv"),
+                             "teachers_template.csv", "text/csv")
         with col3:
-            with open("templates/lessons.csv", "rb") as f:
-                st.download_button("📖 授業テンプレート", f, "lessons_template.csv", "text/csv")
+            st.download_button("📖 授業テンプレート", read_csv_with_bom("templates/lessons.csv"),
+                             "lessons_template.csv", "text/csv")
 
         st.divider()
 
