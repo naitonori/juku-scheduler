@@ -53,6 +53,9 @@ class Lesson:
     explanation_slots: int = 0   # 解説時間（スロット数）
     fixed_start: Optional[int] = None  # 開始時間固定（スロット番号）
     tags: list = field(default_factory=list)  # ["最難関大", "選抜"] 等
+    broadcast_targets: list = field(default_factory=list)
+    # [(campus_name, num_students), ...] 配信先校舎と生徒数
+    # 例: [("福岡校", 8), ("長野校", 5), ("上田校", 3)]
 
 
 # ============================================================
@@ -163,31 +166,65 @@ def build_and_solve(
             )
         model.add_exactly_one(room_bools.values())
 
+        # --- 配信先教室割当 BoolVar ---
+        shadow_room_bools_list = []  # [(campus, {room_id: BoolVar}), ...]
+        for t_idx, (target_campus, target_students) in enumerate(les.broadcast_targets):
+            if target_campus == les.campus:
+                raise ValueError(
+                    f"授業 '{les.name}': 配信先校舎 '{target_campus}' が "
+                    f"配信元校舎と同じです。"
+                )
+            target_campus_rooms = rooms_by_campus.get(target_campus, [])
+            shadow_bools = {}
+            for r in target_campus_rooms:
+                if r.capacity >= target_students:
+                    b = model.new_bool_var(f"shadow_room_{i}_t{t_idx}_{r.room_id}")
+                    shadow_bools[r.room_id] = b
+            if not shadow_bools:
+                raise ValueError(
+                    f"配信授業 '{les.name}' (配信先: {target_campus}, "
+                    f"生徒数{target_students}) を収容できる教室が "
+                    f"校舎 '{target_campus}' に存在しません。"
+                )
+            model.add_exactly_one(shadow_bools.values())
+            shadow_room_bools_list.append((target_campus, shadow_bools))
+        lv["shadow_room_bools"] = shadow_room_bools_list
+
         lesson_vars.append(lv)
 
     # ================================================================
     # 制約1 & 3: 教室の重複禁止 (同校舎・同教室で NoOverlap)
+    #   配信先教室も含めて統合的に NoOverlap を適用
     # ================================================================
-    for campus, c_rooms in rooms_by_campus.items():
-        for r in c_rooms:
-            optional_intervals = []
-            for i, les in enumerate(lessons):
-                if les.campus != campus:
-                    continue
-                rb = lesson_vars[i]["room_bools"]
-                if r.room_id not in rb:
-                    continue
-                # この授業がこの教室に割り当てられた場合のみ有効な OptionalInterval
-                opt = model.new_optional_interval_var(
-                    lesson_vars[i]["start"],
-                    les.test_slots + les.explanation_slots if les.is_test_zemi else les.duration_slots,
-                    lesson_vars[i]["end"],
-                    rb[r.room_id],
-                    f"opt_room_{i}_{r.room_id}",
+    # room_id → [(lesson_idx, BoolVar, start, end, duration, tag)] のマップ構築
+    room_assignments: dict[str, list] = {}
+    for i, les in enumerate(lessons):
+        lv = lesson_vars[i]
+        dur = les.test_slots + les.explanation_slots if les.is_test_zemi else les.duration_slots
+
+        # 配信元の教室割当
+        for rid, bv in lv["room_bools"].items():
+            room_assignments.setdefault(rid, []).append(
+                (i, bv, lv["start"], lv["end"], dur, f"opt_room_{i}_{rid}")
+            )
+
+        # 配信先の教室割当（同じ start/end を共有）
+        for t_idx, (_, shadow_bools) in enumerate(lv["shadow_room_bools"]):
+            for rid, bv in shadow_bools.items():
+                room_assignments.setdefault(rid, []).append(
+                    (i, bv, lv["start"], lv["end"], dur, f"opt_shadow_{i}_t{t_idx}_{rid}")
                 )
-                optional_intervals.append(opt)
-            if optional_intervals:
-                model.add_no_overlap(optional_intervals)
+
+    # room_id ごとに NoOverlap
+    for rid, assignments in room_assignments.items():
+        optional_intervals = []
+        for (lesson_idx, bool_var, start_var, end_var, dur, name) in assignments:
+            opt = model.new_optional_interval_var(
+                start_var, dur, end_var, bool_var, name,
+            )
+            optional_intervals.append(opt)
+        if len(optional_intervals) > 1:
+            model.add_no_overlap(optional_intervals)
 
     # ================================================================
     # 制約4a: 講師の重複禁止
@@ -380,6 +417,7 @@ def build_and_solve(
     results = []
     for i, les in enumerate(lessons):
         lv = lesson_vars[i]
+        has_broadcast = len(les.broadcast_targets) > 0
 
         # 割り当て教室
         assigned_room = None
@@ -387,6 +425,8 @@ def build_and_solve(
             if solver.value(bv):
                 assigned_room = rid
                 break
+
+        broadcast_label = "📡 配信元" if has_broadcast else ""
 
         if les.is_test_zemi:
             ts_val = solver.value(lv["test_start"])
@@ -406,6 +446,7 @@ def build_and_solve(
                 "開始slot": ts_val,
                 "終了slot": te_val,
                 "生徒数": les.num_students,
+                "配信": broadcast_label,
             })
             results.append({
                 "授業ID": les.lesson_id,
@@ -420,6 +461,7 @@ def build_and_solve(
                 "開始slot": es_val,
                 "終了slot": ee_val,
                 "生徒数": les.num_students,
+                "配信": broadcast_label,
             })
         else:
             s_val = solver.value(lv["start"])
@@ -437,7 +479,67 @@ def build_and_solve(
                 "開始slot": s_val,
                 "終了slot": e_val,
                 "生徒数": les.num_students,
+                "配信": broadcast_label,
             })
+
+        # --- 配信先の結果行を追加 ---
+        for t_idx, (target_campus, target_students) in enumerate(les.broadcast_targets):
+            _, shadow_bools = lv["shadow_room_bools"][t_idx]
+            assigned_shadow_room = None
+            for rid, bv in shadow_bools.items():
+                if solver.value(bv):
+                    assigned_shadow_room = rid
+                    break
+
+            shadow_label = f"📡 {les.campus}より配信"
+
+            if les.is_test_zemi:
+                results.append({
+                    "授業ID": les.lesson_id,
+                    "講座名": les.name,
+                    "種別": "テストゼミ(テスト)",
+                    "科目": les.subject,
+                    "校舎": target_campus,
+                    "教室": assigned_shadow_room,
+                    "講師": teacher_map[les.teacher_id].name,
+                    "開始": slot_to_time(ts_val),
+                    "終了": slot_to_time(te_val),
+                    "開始slot": ts_val,
+                    "終了slot": te_val,
+                    "生徒数": target_students,
+                    "配信": shadow_label,
+                })
+                results.append({
+                    "授業ID": les.lesson_id,
+                    "講座名": les.name,
+                    "種別": "テストゼミ(解説)",
+                    "科目": les.subject,
+                    "校舎": target_campus,
+                    "教室": assigned_shadow_room,
+                    "講師": teacher_map[les.teacher_id].name,
+                    "開始": slot_to_time(es_val),
+                    "終了": slot_to_time(ee_val),
+                    "開始slot": es_val,
+                    "終了slot": ee_val,
+                    "生徒数": target_students,
+                    "配信": shadow_label,
+                })
+            else:
+                results.append({
+                    "授業ID": les.lesson_id,
+                    "講座名": les.name,
+                    "種別": "通常授業",
+                    "科目": les.subject,
+                    "校舎": target_campus,
+                    "教室": assigned_shadow_room,
+                    "講師": teacher_map[les.teacher_id].name,
+                    "開始": slot_to_time(s_val),
+                    "終了": slot_to_time(e_val),
+                    "開始slot": s_val,
+                    "終了slot": e_val,
+                    "生徒数": target_students,
+                    "配信": shadow_label,
+                })
 
     result_df = pd.DataFrame(results)
     result_df.sort_values(["校舎", "開始slot", "教室"], inplace=True)
@@ -500,10 +602,18 @@ def generate_mock_data():
     # 時間換算: 45分=9, 60分=12, 90分=18, 120分=24
     lessons = [
         # === 代々木校: 最難関大/選抜 講座 (裏番組NGルールの検証用) ===
-        Lesson("L01", "最難関大 英語α", "代々木校", "英語", "T01", 18, 25, tags=["最難関大"]),
-        Lesson("L02", "最難関大 数学α", "代々木校", "数学", "T02", 18, 20, tags=["最難関大"]),
+        # L01, L02: 全校舎へ配信
+        Lesson("L01", "最難関大 英語α", "代々木校", "英語", "T01", 18, 25,
+               tags=["最難関大"],
+               broadcast_targets=[("福岡校", 8), ("長野校", 5), ("上田校", 3)]),
+        Lesson("L02", "最難関大 数学α", "代々木校", "数学", "T02", 18, 20,
+               tags=["最難関大"],
+               broadcast_targets=[("福岡校", 7), ("長野校", 4), ("上田校", 3)]),
         Lesson("L03", "最難関大 国語α", "代々木校", "国語", "T04", 18, 20, tags=["最難関大"]),
-        Lesson("L04", "選抜 物理",      "代々木校", "物理", "T06", 18, 12, tags=["選抜"]),
+        # L04: 福岡・長野のみ配信
+        Lesson("L04", "選抜 物理",      "代々木校", "物理", "T06", 18, 12,
+               tags=["選抜"],
+               broadcast_targets=[("福岡校", 5), ("長野校", 3)]),
         Lesson("L05", "選抜 化学",      "代々木校", "化学", "T07", 18, 12, tags=["選抜"]),
         Lesson("L06", "選抜 世界史",    "代々木校", "世界史", "T09", 18, 14, tags=["選抜"]),
         Lesson("L07", "選抜 日本史",    "代々木校", "日本史", "T10", 18, 14, tags=["選抜"]),

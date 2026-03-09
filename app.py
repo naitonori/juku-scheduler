@@ -89,6 +89,24 @@ def parse_lessons_csv(df: pd.DataFrame) -> list[Lesson]:
         if "選抜" in name:
             tags.append("選抜")
 
+        # --- 配信先校舎の解析 ---
+        broadcast_targets = []
+        bt_raw = row.get("配信先校舎")
+        bs_raw = row.get("配信先生徒数")
+        if pd.notna(bt_raw) and str(bt_raw).strip():
+            target_campuses = [c.strip() for c in str(bt_raw).split(";") if c.strip()]
+            if pd.notna(bs_raw) and str(bs_raw).strip():
+                target_students = [int(s.strip()) for s in str(bs_raw).split(";") if s.strip()]
+            else:
+                # 配信先生徒数が未指定の場合、配信元の生徒数をデフォルトに
+                target_students = [int(row["生徒数"])] * len(target_campuses)
+            if len(target_students) != len(target_campuses):
+                raise ValueError(
+                    f"授業 '{name}': 配信先校舎の数({len(target_campuses)})と"
+                    f"配信先生徒数の数({len(target_students)})が一致しません。"
+                )
+            broadcast_targets = list(zip(target_campuses, target_students))
+
         lessons.append(Lesson(
             lesson_id=str(row["授業ID"]).strip(),
             name=name,
@@ -102,6 +120,7 @@ def parse_lessons_csv(df: pd.DataFrame) -> list[Lesson]:
             explanation_slots=expl_min // SLOT_MINUTES,
             fixed_start=fixed,
             tags=tags,
+            broadcast_targets=broadcast_targets,
         ))
     return lessons
 
@@ -151,6 +170,15 @@ def build_gantt_html(df: pd.DataFrame) -> str:
     for subj in sorted(used_subjects):
         c = subject_colors.get(subj, default_color)
         legend_html += f'<div class="legend-item"><div class="legend-swatch" style="background:{c}"></div>{subj}</div>'
+    # 配信授業がある場合は凡例に追加
+    has_broadcast = "配信" in df.columns and df["配信"].str.contains("配信", na=False).any()
+    if has_broadcast:
+        legend_html += (
+            '<div class="legend-item">'
+            '<div class="legend-swatch" style="background:#4A90D9;border:2px dashed #fff;"></div>'
+            '📡 配信（受信側）'
+            '</div>'
+        )
     legend_html += '</div>'
     html_parts.append(legend_html)
 
@@ -193,10 +221,24 @@ def build_gantt_html(df: pd.DataFrame) -> str:
                     kind = "🔸" if "テスト)" in row["種別"] else "🔹"
                     if "テスト)" in row["種別"]:
                         color = "#7f8c8d"
+
+                # 配信の視覚表示
+                broadcast_info = row.get("配信", "") if "配信" in row.index else ""
+                extra_style = ""
+                broadcast_icon = ""
+                if broadcast_info:
+                    if "配信元" in broadcast_info and "より" not in broadcast_info:
+                        broadcast_icon = "📡"
+                    elif "より配信" in broadcast_info:
+                        broadcast_icon = "📡"
+                        extra_style = "border:2px dashed rgba(255,255,255,0.7);"
+
                 tooltip = f'{row["講座名"]} ({row["開始"]}~{row["終了"]}) {row["講師"]} {row["種別"]}'
+                if broadcast_info:
+                    tooltip += f' [{broadcast_info}]'
                 html_parts.append(
-                    f'<div class="gantt-bar" style="left:{left_pct}%;width:{width_pct}%;background:{color};" '
-                    f'title="{tooltip}">{kind}{label}</div>'
+                    f'<div class="gantt-bar" style="left:{left_pct}%;width:{width_pct}%;background:{color};{extra_style}" '
+                    f'title="{tooltip}">{broadcast_icon}{kind}{label}</div>'
                 )
             html_parts.append('</td></tr>')
 
@@ -352,9 +394,10 @@ def main():
                 tabs = st.tabs([f"📍 {c}" for c in campuses])
                 for tab, campus in zip(tabs, campuses):
                     with tab:
-                        campus_df = result_df[result_df["校舎"] == campus][
-                            ["講座名", "種別", "科目", "教室", "開始", "終了", "講師", "生徒数"]
-                        ]
+                        display_cols = ["講座名", "種別", "科目", "教室", "開始", "終了", "講師", "生徒数"]
+                        if "配信" in result_df.columns:
+                            display_cols.append("配信")
+                        campus_df = result_df[result_df["校舎"] == campus][display_cols]
                         st.dataframe(
                             campus_df,
                             use_container_width=True,
