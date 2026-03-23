@@ -289,13 +289,13 @@ def main():
 
         with col1:
             st.download_button("🏫 教室テンプレート", read_csv_with_bom("templates/rooms.csv"),
-                             "rooms_template.csv", "text/csv")
+                             "rooms_template.csv", "application/octet-stream")
         with col2:
             st.download_button("👨‍🏫 講師テンプレート", read_csv_with_bom("templates/teachers.csv"),
-                             "teachers_template.csv", "text/csv")
+                             "teachers_template.csv", "application/octet-stream")
         with col3:
             st.download_button("📖 授業テンプレート", read_csv_with_bom("templates/lessons.csv"),
-                             "lessons_template.csv", "text/csv")
+                             "lessons_template.csv", "application/octet-stream")
 
         st.divider()
 
@@ -409,13 +409,13 @@ def main():
 
                 # --- CSV ダウンロード ---
                 st.subheader("💾 結果のダウンロード")
-                csv_buf = io.StringIO()
+                csv_buf = io.BytesIO()
                 result_df.to_csv(csv_buf, index=False, encoding="utf-8-sig")
                 st.download_button(
                     "📥 結果CSVをダウンロード",
                     csv_buf.getvalue(),
                     "timetable_result.csv",
-                    "text/csv",
+                    "application/octet-stream",
                 )
             else:
                 st.error(
