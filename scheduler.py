@@ -7,6 +7,7 @@ from ortools.sat.python import cp_model
 import pandas as pd
 from dataclasses import dataclass, field
 from typing import Optional
+from datetime import date, timedelta
 
 # ============================================================
 # 定数
@@ -56,6 +57,57 @@ class Lesson:
     broadcast_targets: list = field(default_factory=list)
     # [(campus_name, num_students), ...] 配信先校舎と生徒数
     # 例: [("福岡校", 8), ("長野校", 5), ("上田校", 3)]
+
+
+# ============================================================
+# 講習会モード用データクラス
+# ============================================================
+@dataclass
+class IntensiveTeacher:
+    teacher_id: str
+    name: str
+    available_slots: dict       # {day_index: (start_slot, end_slot)} 日別の稼働時間帯
+
+    @property
+    def available_days(self) -> list:
+        return sorted(self.available_slots.keys())
+
+    def start_slot_for_day(self, day: int) -> int:
+        return self.available_slots[day][0]
+
+    def end_slot_for_day(self, day: int) -> int:
+        return self.available_slots[day][1]
+
+    @classmethod
+    def from_uniform(cls, teacher_id: str, name: str, days: list, start_slot: int, end_slot: int):
+        """全日同じ時間帯で作成（後方互換用）"""
+        return cls(teacher_id, name, {d: (start_slot, end_slot) for d in days})
+
+@dataclass
+class IntensiveLesson:
+    lesson_id: str
+    name: str
+    campus: str
+    subject: str
+    teacher_id: str
+    duration_slots: int         # 1回の授業時間（スロット数）
+    num_students: int
+    num_sessions: int           # 授業回数
+    available_days: list        # 配置可能な日のインデックス
+    ng_group: str = ""          # NGグループ（同グループは同日同時刻NG）
+    broadcast_targets: list = field(default_factory=list)
+
+
+def intensive_slot_to_time(t: int) -> str:
+    """講習会モード用: スロット番号 -> "HH:MM" 文字列 (0:00ベース, 5分刻み)"""
+    total_min = t * SLOT_MINUTES
+    return f"{total_min // 60:02d}:{total_min % 60:02d}"
+
+
+def intensive_time_to_slot(time_str: str) -> int:
+    """講習会モード用: "HH:MM" -> スロット番号 (0:00ベース, 5分刻み)"""
+    h, m = map(int, time_str.strip().split(":"))
+    return (h * 60 + m) // SLOT_MINUTES
 
 
 # ============================================================
@@ -674,6 +726,320 @@ def print_timetable(df: pd.DataFrame):
                   f"{row['教室']:<14} {row['開始']:>5} ~ {row['終了']:<5} "
                   f"{row['講師']:<10} {row['生徒数']:>4}")
         print()
+
+
+# ============================================================
+# 講習会モード ソルバー
+# ============================================================
+def build_and_solve_intensive(
+    rooms: list[Room],
+    teachers: list[IntensiveTeacher],
+    lessons: list[IntensiveLesson],
+    date_list: list,
+    time_limit_sec: float = 60.0,
+):
+    """
+    講習会モード: 複数日にわたる時間割を最適化する。
+
+    Returns:
+        result_df: 結果の DataFrame (成功時) or None
+        status: ソルバーステータス文字列
+    """
+    model = cp_model.CpModel()
+
+    # --- 前処理 ---
+    teacher_map = {t.teacher_id: t for t in teachers}
+    rooms_by_campus: dict[str, list[Room]] = {}
+    for r in rooms:
+        rooms_by_campus.setdefault(r.campus, []).append(r)
+
+    num_days = len(date_list)
+    all_day_indices = list(range(num_days))
+
+    # ================================================================
+    # 変数の定義
+    # ================================================================
+    # session_vars[i][k] = セッション変数の辞書
+    session_vars = []  # session_vars[i] = list of dicts (k=0..num_sessions-1)
+
+    for i, les in enumerate(lessons):
+        teacher = teacher_map[les.teacher_id]
+        avail_days = sorted(set(les.available_days) & set(teacher.available_days))
+
+        if len(avail_days) < les.num_sessions:
+            raise ValueError(
+                f"授業 '{les.name}': 必要な授業回数({les.num_sessions})に対して "
+                f"利用可能な日数({len(avail_days)})が不足しています。"
+            )
+
+        # 教室候補
+        campus_rooms = rooms_by_campus.get(les.campus, [])
+        candidate_rooms = [r for r in campus_rooms if r.capacity >= les.num_students]
+        if not candidate_rooms:
+            raise ValueError(
+                f"授業 '{les.name}' (生徒数{les.num_students}) を収容できる教室が "
+                f"校舎 '{les.campus}' に存在しません。"
+            )
+
+        # 全日の時間帯から全体の範囲を算出
+        all_starts = [teacher.start_slot_for_day(d) for d in avail_days]
+        all_ends = [teacher.end_slot_for_day(d) for d in avail_days]
+        global_min_start = min(all_starts)
+        global_max_end = max(all_ends)
+
+        sessions = []
+        for k in range(les.num_sessions):
+            sv = {}
+            # 日割当
+            sv["day"] = model.new_int_var_from_domain(
+                cp_model.Domain.from_values(avail_days), f"day_{i}_{k}"
+            )
+            # 時間スロット（全体範囲で変数を作成し、日別制約で絞る）
+            sv["start"] = model.new_int_var(
+                global_min_start,
+                global_max_end - les.duration_slots,
+                f"start_{i}_{k}"
+            )
+            sv["end"] = model.new_int_var(
+                global_min_start + les.duration_slots,
+                global_max_end,
+                f"end_{i}_{k}"
+            )
+            model.Add(sv["end"] == sv["start"] + les.duration_slots)
+
+            # 各候補日の BoolVar + 日別時間帯制約
+            sv["on_day"] = {}
+            for d in avail_days:
+                b = model.new_bool_var(f"on_day_{i}_{k}_{d}")
+                model.Add(sv["day"] == d).OnlyEnforceIf(b)
+                model.Add(sv["day"] != d).OnlyEnforceIf(b.Not())
+                # 日別の稼働時間帯制約
+                day_start = teacher.start_slot_for_day(d)
+                day_end = teacher.end_slot_for_day(d)
+                model.Add(sv["start"] >= day_start).OnlyEnforceIf(b)
+                model.Add(sv["end"] <= day_end).OnlyEnforceIf(b)
+                sv["on_day"][d] = b
+
+            # 教室割当 BoolVar
+            room_bools = {}
+            for r in candidate_rooms:
+                rb = model.new_bool_var(f"room_{i}_{k}_{r.room_id}")
+                room_bools[r.room_id] = rb
+            model.add_exactly_one(room_bools.values())
+            sv["room_bools"] = room_bools
+
+            sessions.append(sv)
+
+        # 同一講座のセッションは異なる日に配置
+        model.add_all_different([sv["day"] for sv in sessions])
+
+        session_vars.append(sessions)
+
+    # ================================================================
+    # 制約: 教室の重複禁止 (教室 x 日 ごとに NoOverlap)
+    # ================================================================
+    # room_day_intervals[room_id][day] = [(opt_interval, ...)]
+    room_day_intervals: dict[str, dict[int, list]] = {}
+
+    for i, les in enumerate(lessons):
+        teacher = teacher_map[les.teacher_id]
+        avail_days = sorted(set(les.available_days) & set(teacher.available_days))
+        for k, sv in enumerate(session_vars[i]):
+            for d in avail_days:
+                for rid, rb in sv["room_bools"].items():
+                    # 合成ブール: on_day_d AND room_r
+                    combined = model.new_bool_var(f"comb_{i}_{k}_{d}_{rid}")
+                    model.AddBoolAnd([sv["on_day"][d], rb]).OnlyEnforceIf(combined)
+                    model.AddBoolOr([sv["on_day"][d].Not(), rb.Not()]).OnlyEnforceIf(combined.Not())
+
+                    opt = model.new_optional_interval_var(
+                        sv["start"], les.duration_slots, sv["end"],
+                        combined, f"opt_room_{i}_{k}_{d}_{rid}"
+                    )
+                    room_day_intervals.setdefault(rid, {}).setdefault(d, []).append(opt)
+
+    for rid, day_map in room_day_intervals.items():
+        for d, intervals in day_map.items():
+            if len(intervals) > 1:
+                model.add_no_overlap(intervals)
+
+    # ================================================================
+    # 制約: 講師の重複禁止 (講師 x 日 ごとに NoOverlap)
+    # ================================================================
+    teacher_day_intervals: dict[str, dict[int, list]] = {}
+
+    for i, les in enumerate(lessons):
+        teacher = teacher_map[les.teacher_id]
+        avail_days = sorted(set(les.available_days) & set(teacher.available_days))
+        for k, sv in enumerate(session_vars[i]):
+            for d in avail_days:
+                opt = model.new_optional_interval_var(
+                    sv["start"], les.duration_slots, sv["end"],
+                    sv["on_day"][d], f"opt_teacher_{i}_{k}_{d}"
+                )
+                teacher_day_intervals.setdefault(les.teacher_id, {}).setdefault(d, []).append(opt)
+
+    for tid, day_map in teacher_day_intervals.items():
+        for d, intervals in day_map.items():
+            if len(intervals) > 1:
+                model.add_no_overlap(intervals)
+
+    # ================================================================
+    # 制約: NGグループ (同グループの講座は同日同時刻NG)
+    # ================================================================
+    ng_day_intervals: dict[str, dict[int, list]] = {}
+
+    for i, les in enumerate(lessons):
+        if not les.ng_group:
+            continue
+        teacher = teacher_map[les.teacher_id]
+        avail_days = sorted(set(les.available_days) & set(teacher.available_days))
+        for k, sv in enumerate(session_vars[i]):
+            for d in avail_days:
+                opt = model.new_optional_interval_var(
+                    sv["start"], les.duration_slots, sv["end"],
+                    sv["on_day"][d], f"opt_ng_{i}_{k}_{d}"
+                )
+                ng_day_intervals.setdefault(les.ng_group, {}).setdefault(d, []).append(opt)
+
+    for ng, day_map in ng_day_intervals.items():
+        for d, intervals in day_map.items():
+            if len(intervals) > 1:
+                model.add_no_overlap(intervals)
+
+    # ================================================================
+    # ソフト制約: セッションをなるべく連続日に詰める
+    # ================================================================
+    penalty_vars = []
+    for i, les in enumerate(lessons):
+        if les.num_sessions < 2:
+            continue
+        days_list = [sv["day"] for sv in session_vars[i]]
+        span_max = model.new_int_var(0, num_days, f"span_max_{i}")
+        span_min = model.new_int_var(0, num_days, f"span_min_{i}")
+        model.add_max_equality(span_max, days_list)
+        model.add_min_equality(span_min, days_list)
+        span = model.new_int_var(0, num_days, f"span_{i}")
+        model.Add(span == span_max - span_min)
+        penalty_vars.append(span)
+
+    if penalty_vars:
+        model.Minimize(sum(penalty_vars))
+
+    # ================================================================
+    # 求解
+    # ================================================================
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = time_limit_sec
+    solver.parameters.num_workers = 8
+
+    status = solver.solve(model)
+    status_name = solver.status_name(status)
+
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        print(f"[WARN] ソルバーステータス: {status_name}")
+        return None, status_name
+
+    # ================================================================
+    # 結果の抽出
+    # ================================================================
+    results = []
+    for i, les in enumerate(lessons):
+        teacher = teacher_map[les.teacher_id]
+        for k, sv in enumerate(session_vars[i]):
+            day_idx = solver.value(sv["day"])
+            s_val = solver.value(sv["start"])
+            e_val = solver.value(sv["end"])
+
+            assigned_room = None
+            for rid, rb in sv["room_bools"].items():
+                if solver.value(rb):
+                    assigned_room = rid
+                    break
+
+            results.append({
+                "授業ID": les.lesson_id,
+                "講座名": les.name,
+                "科目": les.subject,
+                "校舎": les.campus,
+                "教室": assigned_room,
+                "講師": teacher.name,
+                "日付": date_list[day_idx].strftime("%m/%d"),
+                "日付index": day_idx,
+                "開始": intensive_slot_to_time(s_val),
+                "終了": intensive_slot_to_time(e_val),
+                "開始slot": s_val,
+                "終了slot": e_val,
+                "生徒数": les.num_students,
+                "回": f"{k+1}/{les.num_sessions}",
+                "NGグループ": les.ng_group,
+                "配信": "",
+            })
+
+    result_df = pd.DataFrame(results)
+    result_df.sort_values(["日付index", "校舎", "開始slot", "教室"], inplace=True)
+    result_df.reset_index(drop=True, inplace=True)
+
+    obj_val = solver.objective_value if penalty_vars else 0
+    print(f"\n[INFO] ステータス: {status_name}")
+    print(f"[INFO] 目的関数値 (セッション日程スパン合計): {obj_val}")
+
+    return result_df, status_name
+
+
+# ============================================================
+# 講習会モード モックデータ
+# ============================================================
+def generate_intensive_mock_data():
+    """講習会モードのテスト用モックデータを生成"""
+
+    # 期間: 7/20〜8/30 (42日間)
+    start_date = date(2026, 7, 20)
+    end_date = date(2026, 8, 30)
+    num_days = (end_date - start_date).days + 1
+    date_list = [start_date + timedelta(days=d) for d in range(num_days)]
+
+    rooms = [
+        Room("代々木校", "代々木校_R1", 8),
+        Room("代々木校", "代々木校_R2", 30),
+        Room("代々木校", "代々木校_R3", 15),
+        Room("代々木校", "代々木校_R4", 45),
+    ]
+
+    # 講師 (15:00=slot180, 20:00=slot240, 21:00=slot252)
+    # 講師Aは前半と後半で時間帯が異なる例
+    teacher_a_slots = {}
+    for d in range(num_days):
+        if d < 21:  # 7/20-8/9: 15:00-20:00
+            teacher_a_slots[d] = (180, 240)
+        else:       # 8/10-8/30: 10:00-17:00
+            teacher_a_slots[d] = (120, 204)
+
+    teachers = [
+        IntensiveTeacher("T01", "講師A", teacher_a_slots),
+        IntensiveTeacher.from_uniform("T02", "講師B", list(range(5, 15)), 180, 252),   # 7/25-8/3, 15:00-21:00
+        IntensiveTeacher.from_uniform("T03", "講師C", list(range(num_days)), 180, 252), # 全期間, 15:00-21:00
+        IntensiveTeacher.from_uniform("T04", "講師D", list(range(20)), 180, 240),       # 7/20-8/8, 15:00-20:00
+    ]
+
+    # 授業: 120分=24slots, 180分=36slots, 90分=18slots
+    lessons = [
+        # NGグループA: 物理と数学は同時にできない（同じ生徒が受講）
+        IntensiveLesson("L01", "物理講習", "代々木校", "物理", "T01",
+                        24, 25, 5, list(range(21)), "A"),         # 7/20-8/9, 5回
+        IntensiveLesson("L02", "数学講習", "代々木校", "数学", "T02",
+                        36, 20, 8, list(range(5, 15)), "A"),      # 7/25-8/3, 8回
+        # NGグループB: 英語と国語は同時にできない
+        IntensiveLesson("L03", "英語講習", "代々木校", "英語", "T03",
+                        18, 15, 10, list(range(num_days)), "B"),  # 全期間, 10回
+        IntensiveLesson("L04", "国語講習", "代々木校", "国語", "T04",
+                        18, 10, 6, list(range(20)), "B"),         # 7/20-8/8, 6回
+        # NGグループなし
+        IntensiveLesson("L05", "化学特別講習", "代々木校", "化学", "T01",
+                        18, 8, 3, list(range(21, num_days)), ""), # 8/10-8/30, 3回
+    ]
+
+    return rooms, teachers, lessons, date_list
 
 
 # ============================================================
