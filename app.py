@@ -12,7 +12,9 @@ from scheduler import (
     build_and_solve, slot_to_time,
     SLOT_MINUTES, DAY_START_HOUR, DAY_START_MIN, MAX_SLOT,
     IntensiveTeacher, IntensiveLesson,
-    build_and_solve_intensive, intensive_slot_to_time, intensive_time_to_slot,
+    build_and_solve_intensive, build_and_solve_intensive_phased,
+    diagnose_intensive,
+    intensive_slot_to_time, intensive_time_to_slot,
 )
 
 # ============================================================
@@ -220,6 +222,11 @@ def parse_intensive_lessons_csv(df: pd.DataFrame, date_list: list[date]) -> list
                 target_students = [int(row["生徒数"])] * len(target_campuses)
             broadcast_targets = list(zip(target_campuses, target_students))
 
+        # 時間帯制限 (新機能)
+        time_band = str(row.get("時間帯制限", "")).strip() if pd.notna(row.get("時間帯制限")) else ""
+        # NG優先度 (新機能): 0=ハード, 1=ソフト(重), 2=ソフト(軽)
+        ng_priority = int(row.get("NG優先度", 0)) if pd.notna(row.get("NG優先度")) and str(row.get("NG優先度")).strip() else 0
+
         lessons.append(IntensiveLesson(
             lesson_id=str(row["授業ID"]).strip(),
             name=name,
@@ -232,6 +239,8 @@ def parse_intensive_lessons_csv(df: pd.DataFrame, date_list: list[date]) -> list
             available_days=avail_days,
             ng_group=ng_group,
             broadcast_targets=broadcast_targets,
+            time_band=time_band,
+            ng_group_priority=ng_priority,
         ))
     return lessons
 
@@ -628,6 +637,8 @@ def run_intensive_mode(data_mode: str, time_limit: int):
 | 終了日 | 講座終了日（M/D形式） | 8/10 |
 | 配信先校舎 | 配信先（;区切り） | |
 | 配信先生徒数 | 配信先生徒数（;区切り） | |
+| 時間帯制限 | 配置可能な時間帯（HH:MM-HH:MM） | 15:00-18:00 |
+| NG優先度 | 0=絶対NG, 1=できれば避ける, 2=許容 | 0 |
             """)
 
         st.divider()
@@ -707,9 +718,24 @@ def run_intensive_mode(data_mode: str, time_limit: int):
             )
 
         if run_btn:
-            with st.spinner("⏳ 講習時間割を最適化中... （期間が長い場合、時間がかかることがあります）"):
+            # --- 事前診断 ---
+            diagnostics = diagnose_intensive(rooms, teachers, lessons, date_list)
+            if diagnostics:
+                critical = [d for d in diagnostics if d["severity"] == "critical"]
+                warns = [d for d in diagnostics if d["severity"] == "warning"]
+                if critical:
+                    st.error("**事前診断: 致命的な問題が見つかりました**")
+                    for diag in critical:
+                        st.markdown(f"- **{diag['category']}**: {diag['message']}")
+                if warns:
+                    with st.expander(f"⚠️ 事前診断: 警告 {len(warns)}件", expanded=False):
+                        for diag in warns:
+                            st.warning(f"**{diag['category']}**: {diag['message']}")
+
+            # --- 段階的求解 ---
+            with st.spinner("⏳ 講習時間割を最適化中... （段階的に制約を緩和しながら最適解を探索します）"):
                 try:
-                    result_df, status = build_and_solve_intensive(
+                    result_df, status, relaxations = build_and_solve_intensive_phased(
                         rooms, teachers, lessons, date_list, time_limit
                     )
                 except ValueError as e:
@@ -718,6 +744,8 @@ def run_intensive_mode(data_mode: str, time_limit: int):
 
             if result_df is not None and not result_df.empty:
                 st.success(f"✅ 最適化完了！ ステータス: **{status}**")
+                if relaxations:
+                    st.info("**制約緩和あり:** " + " / ".join(relaxations))
 
                 # --- 日付選択 ---
                 st.subheader("📊 日付別ガントチャート")
@@ -761,12 +789,17 @@ def run_intensive_mode(data_mode: str, time_limit: int):
                 st.download_button("📥 結果CSVをダウンロード", csv_buf.getvalue(),
                                  "intensive_timetable_result.csv", "application/octet-stream")
             else:
-                st.error(
-                    f"❌ 解が見つかりませんでした（ステータス: {status}）。\n\n"
-                    "制約条件が厳しすぎる可能性があります。\n"
-                    "- 授業回数に対して利用可能日数が十分か確認してください\n"
-                    "- 講師の稼働時間内に授業が収まるか確認してください\n"
-                    "- NGグループの制約が厳しすぎないか確認してください"
+                st.error(f"❌ 解が見つかりませんでした（ステータス: {status}）")
+                if diagnostics:
+                    st.subheader("問題の原因分析")
+                    for diag in diagnostics:
+                        icon = "🔴" if diag["severity"] == "critical" else "🟡"
+                        st.markdown(f"{icon} **{diag['category']}**: {diag['message']}")
+                st.info(
+                    "**対処法:**\n"
+                    "- 授業CSVの「NG優先度」列を `1`（ソフト）に変更する\n"
+                    "- 授業回数を減らす / 講師の出講可能期間を広げる\n"
+                    "- ソルバー制限時間を長くする（120秒以上推奨）"
                 )
     else:
         st.warning("データを読み込んでから「講習時間割を生成する」ボタンを押してください。")

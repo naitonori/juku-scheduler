@@ -96,6 +96,16 @@ class IntensiveLesson:
     available_days: list        # 配置可能な日のインデックス
     ng_group: str = ""          # NGグループ（同グループは同日同時刻NG）
     broadcast_targets: list = field(default_factory=list)
+    time_band: str = ""         # 時間帯制限 "HH:MM-HH:MM" 形式。空=制限なし
+    ng_group_priority: int = 0  # 0=ハード, 1=ソフト(重ペナルティ), 2=ソフト(軽ペナルティ)
+
+
+def parse_time_band(band_str: str) -> tuple[int, int]:
+    """時間帯制限文字列をスロット範囲に変換。"15:00-18:00" -> (180, 216)"""
+    parts = band_str.strip().split("-")
+    if len(parts) != 2:
+        raise ValueError(f"時間帯制限の形式が不正です: '{band_str}' (HH:MM-HH:MM)")
+    return intensive_time_to_slot(parts[0]), intensive_time_to_slot(parts[1])
 
 
 def intensive_slot_to_time(t: int) -> str:
@@ -729,6 +739,114 @@ def print_timetable(df: pd.DataFrame):
 
 
 # ============================================================
+# 講習会モード 事前診断
+# ============================================================
+def diagnose_intensive(
+    rooms: list[Room],
+    teachers: list[IntensiveTeacher],
+    lessons: list[IntensiveLesson],
+    date_list: list,
+) -> list[dict]:
+    """
+    ソルブ前にボトルネックを算術チェックで検出する。
+    Returns: [{"severity": "critical"|"warning", "category": str, "message": str}, ...]
+    """
+    warnings = []
+    teacher_map = {t.teacher_id: t for t in teachers}
+    rooms_by_campus: dict[str, list[Room]] = {}
+    for r in rooms:
+        rooms_by_campus.setdefault(r.campus, []).append(r)
+
+    # --- 講師別・日別 負荷チェック ---
+    teacher_day_load: dict[str, dict[int, int]] = {}  # tid -> {day: total_slots}
+    for les in lessons:
+        teacher = teacher_map.get(les.teacher_id)
+        if not teacher:
+            warnings.append({
+                "severity": "critical", "category": "講師不在",
+                "message": f"授業 '{les.name}' の講師ID '{les.teacher_id}' が見つかりません。"
+            })
+            continue
+        avail_days = sorted(set(les.available_days) & set(teacher.available_days))
+        if len(avail_days) < les.num_sessions:
+            warnings.append({
+                "severity": "critical", "category": "日数不足",
+                "message": (
+                    f"授業 '{les.name}': 必要回数 {les.num_sessions}回 に対して "
+                    f"利用可能日数 {len(avail_days)}日 しかありません。"
+                )
+            })
+        # 最低限の1日あたり負荷見積もり
+        for d in avail_days:
+            teacher_day_load.setdefault(les.teacher_id, {}).setdefault(d, 0)
+            teacher_day_load[les.teacher_id][d] += les.duration_slots
+
+    for tid, day_loads in teacher_day_load.items():
+        teacher = teacher_map[tid]
+        for d, total_slots in day_loads.items():
+            if d not in teacher.available_slots:
+                continue
+            window = teacher.end_slot_for_day(d) - teacher.start_slot_for_day(d)
+            if total_slots > window * 1.5:  # 150%超なら警告
+                warnings.append({
+                    "severity": "warning", "category": "講師過負荷",
+                    "message": (
+                        f"講師 '{teacher.name}' の {date_list[d].strftime('%m/%d')}: "
+                        f"候補授業計 {total_slots * SLOT_MINUTES}分 vs "
+                        f"稼働枠 {window * SLOT_MINUTES}分"
+                    )
+                })
+
+    # --- NGグループ・日別 容量チェック ---
+    ng_day_sessions: dict[str, dict[int, list]] = {}
+    for les in lessons:
+        if not les.ng_group:
+            continue
+        teacher = teacher_map.get(les.teacher_id)
+        if not teacher:
+            continue
+        avail_days = sorted(set(les.available_days) & set(teacher.available_days))
+        for d in avail_days:
+            ng_day_sessions.setdefault(les.ng_group, {}).setdefault(d, []).append(les)
+
+    for ng, day_map in ng_day_sessions.items():
+        for d, day_lessons in day_map.items():
+            total_dur = sum(l.duration_slots for l in day_lessons)
+            # NGグループは同時配置不可なので、全授業を直列に並べる必要がある
+            # 利用可能な最大時間枠を推定
+            max_window = 0
+            for l in day_lessons:
+                t = teacher_map.get(l.teacher_id)
+                if t and d in t.available_slots:
+                    w = t.end_slot_for_day(d) - t.start_slot_for_day(d)
+                    max_window = max(max_window, w)
+            if total_dur > max_window and len(day_lessons) > 1:
+                warnings.append({
+                    "severity": "warning", "category": "NGグループ過密",
+                    "message": (
+                        f"NGグループ '{ng}' の {date_list[d].strftime('%m/%d')}: "
+                        f"候補セッション {len(day_lessons)}件・計 {total_dur * SLOT_MINUTES}分 "
+                        f"(最大枠 {max_window * SLOT_MINUTES}分)"
+                    )
+                })
+
+    # --- 教室容量チェック ---
+    for les in lessons:
+        campus_rooms = rooms_by_campus.get(les.campus, [])
+        candidate_rooms = [r for r in campus_rooms if r.capacity >= les.num_students]
+        if not candidate_rooms:
+            warnings.append({
+                "severity": "critical", "category": "教室不足",
+                "message": (
+                    f"授業 '{les.name}' (生徒数{les.num_students}) を収容できる教室が "
+                    f"校舎 '{les.campus}' にありません。"
+                )
+            })
+
+    return warnings
+
+
+# ============================================================
 # 講習会モード ソルバー
 # ============================================================
 def build_and_solve_intensive(
@@ -737,9 +855,14 @@ def build_and_solve_intensive(
     lessons: list[IntensiveLesson],
     date_list: list,
     time_limit_sec: float = 60.0,
+    _force_soft_ng: bool = False,
+    _force_soft_alldiff: bool = False,
 ):
     """
     講習会モード: 複数日にわたる時間割を最適化する。
+
+    _force_soft_ng: True の場合、全NG制約をソフト化（段階的求解用）
+    _force_soft_alldiff: True の場合、同一講座の全日異なる制約をソフト化
 
     Returns:
         result_df: 結果の DataFrame (成功時) or None
@@ -754,17 +877,30 @@ def build_and_solve_intensive(
         rooms_by_campus.setdefault(r.campus, []).append(r)
 
     num_days = len(date_list)
-    all_day_indices = list(range(num_days))
 
     # ================================================================
     # 変数の定義
     # ================================================================
-    # session_vars[i][k] = セッション変数の辞書
-    session_vars = []  # session_vars[i] = list of dicts (k=0..num_sessions-1)
+    session_vars = []
+    penalty_vars = []  # ソフト制約用ペナルティ
 
     for i, les in enumerate(lessons):
         teacher = teacher_map[les.teacher_id]
         avail_days = sorted(set(les.available_days) & set(teacher.available_days))
+
+        # 時間帯制限があれば、その時間帯に収まらない日を除外
+        if les.time_band:
+            band_start, band_end = parse_time_band(les.time_band)
+            filtered_days = []
+            for d in avail_days:
+                day_start = teacher.start_slot_for_day(d)
+                day_end = teacher.end_slot_for_day(d)
+                # 時間帯制限と講師稼働時間の交差が授業時間以上あるか
+                eff_start = max(day_start, band_start)
+                eff_end = min(day_end, band_end)
+                if eff_end - eff_start >= les.duration_slots:
+                    filtered_days.append(d)
+            avail_days = filtered_days
 
         if len(avail_days) < les.num_sessions:
             raise ValueError(
@@ -781,20 +917,23 @@ def build_and_solve_intensive(
                 f"校舎 '{les.campus}' に存在しません。"
             )
 
-        # 全日の時間帯から全体の範囲を算出
+        # 全日の時間帯から全体の範囲を算出（時間帯制限も考慮）
         all_starts = [teacher.start_slot_for_day(d) for d in avail_days]
         all_ends = [teacher.end_slot_for_day(d) for d in avail_days]
         global_min_start = min(all_starts)
         global_max_end = max(all_ends)
 
+        if les.time_band:
+            band_start, band_end = parse_time_band(les.time_band)
+            global_min_start = max(global_min_start, band_start)
+            global_max_end = min(global_max_end, band_end)
+
         sessions = []
         for k in range(les.num_sessions):
             sv = {}
-            # 日割当
             sv["day"] = model.new_int_var_from_domain(
                 cp_model.Domain.from_values(avail_days), f"day_{i}_{k}"
             )
-            # 時間スロット（全体範囲で変数を作成し、日別制約で絞る）
             sv["start"] = model.new_int_var(
                 global_min_start,
                 global_max_end - les.duration_slots,
@@ -816,6 +955,10 @@ def build_and_solve_intensive(
                 # 日別の稼働時間帯制約
                 day_start = teacher.start_slot_for_day(d)
                 day_end = teacher.end_slot_for_day(d)
+                # 時間帯制限があれば、さらに狭める
+                if les.time_band:
+                    day_start = max(day_start, band_start)
+                    day_end = min(day_end, band_end)
                 model.Add(sv["start"] >= day_start).OnlyEnforceIf(b)
                 model.Add(sv["end"] <= day_end).OnlyEnforceIf(b)
                 sv["on_day"][d] = b
@@ -831,14 +974,23 @@ def build_and_solve_intensive(
             sessions.append(sv)
 
         # 同一講座のセッションは異なる日に配置
-        model.add_all_different([sv["day"] for sv in sessions])
+        if _force_soft_alldiff and les.num_sessions >= 2:
+            # ソフト化: ペアワイズで異なる日ペナルティ
+            for a in range(len(sessions)):
+                for b_idx in range(a + 1, len(sessions)):
+                    same_day = model.new_bool_var(f"sameday_{i}_{a}_{b_idx}")
+                    model.Add(sessions[a]["day"] == sessions[b_idx]["day"]).OnlyEnforceIf(same_day)
+                    model.Add(sessions[a]["day"] != sessions[b_idx]["day"]).OnlyEnforceIf(same_day.Not())
+                    penalty_vars.append((same_day, 5000))  # 重いペナルティ
+        else:
+            if les.num_sessions >= 2:
+                model.add_all_different([sv["day"] for sv in sessions])
 
         session_vars.append(sessions)
 
     # ================================================================
     # 制約: 教室の重複禁止 (教室 x 日 ごとに NoOverlap)
     # ================================================================
-    # room_day_intervals[room_id][day] = [(opt_interval, ...)]
     room_day_intervals: dict[str, dict[int, list]] = {}
 
     for i, les in enumerate(lessons):
@@ -846,8 +998,9 @@ def build_and_solve_intensive(
         avail_days = sorted(set(les.available_days) & set(teacher.available_days))
         for k, sv in enumerate(session_vars[i]):
             for d in avail_days:
+                if d not in sv["on_day"]:
+                    continue
                 for rid, rb in sv["room_bools"].items():
-                    # 合成ブール: on_day_d AND room_r
                     combined = model.new_bool_var(f"comb_{i}_{k}_{d}_{rid}")
                     model.AddBoolAnd([sv["on_day"][d], rb]).OnlyEnforceIf(combined)
                     model.AddBoolOr([sv["on_day"][d].Not(), rb.Not()]).OnlyEnforceIf(combined.Not())
@@ -873,6 +1026,8 @@ def build_and_solve_intensive(
         avail_days = sorted(set(les.available_days) & set(teacher.available_days))
         for k, sv in enumerate(session_vars[i]):
             for d in avail_days:
+                if d not in sv["on_day"]:
+                    continue
                 opt = model.new_optional_interval_var(
                     sv["start"], les.duration_slots, sv["end"],
                     sv["on_day"][d], f"opt_teacher_{i}_{k}_{d}"
@@ -885,32 +1040,94 @@ def build_and_solve_intensive(
                 model.add_no_overlap(intervals)
 
     # ================================================================
-    # 制約: NGグループ (同グループの講座は同日同時刻NG)
+    # 制約: NGグループ (ハード/ソフト 2層化)
     # ================================================================
-    ng_day_intervals: dict[str, dict[int, list]] = {}
+    ng_hard_intervals: dict[str, dict[int, list]] = {}
+    # ソフトNG: (ng_group, day, lesson_idx, session_idx, on_day_bool, start, end, dur)
+    ng_soft_entries: list = []
 
     for i, les in enumerate(lessons):
         if not les.ng_group:
             continue
         teacher = teacher_map[les.teacher_id]
         avail_days = sorted(set(les.available_days) & set(teacher.available_days))
+
+        priority = les.ng_group_priority
+        if _force_soft_ng:
+            priority = max(priority, 1)  # 強制ソフト化
+
         for k, sv in enumerate(session_vars[i]):
             for d in avail_days:
-                opt = model.new_optional_interval_var(
-                    sv["start"], les.duration_slots, sv["end"],
-                    sv["on_day"][d], f"opt_ng_{i}_{k}_{d}"
-                )
-                ng_day_intervals.setdefault(les.ng_group, {}).setdefault(d, []).append(opt)
+                if d not in sv["on_day"]:
+                    continue
+                if priority == 0:
+                    # ハード制約
+                    opt = model.new_optional_interval_var(
+                        sv["start"], les.duration_slots, sv["end"],
+                        sv["on_day"][d], f"opt_ng_{i}_{k}_{d}"
+                    )
+                    ng_hard_intervals.setdefault(les.ng_group, {}).setdefault(d, []).append(opt)
+                else:
+                    # ソフト用に情報を蓄積
+                    ng_soft_entries.append((
+                        les.ng_group, d, priority, i, k,
+                        sv["on_day"][d], sv["start"], sv["end"], les.duration_slots
+                    ))
 
-    for ng, day_map in ng_day_intervals.items():
+    # ハードNGグループ: NoOverlap
+    for ng, day_map in ng_hard_intervals.items():
         for d, intervals in day_map.items():
             if len(intervals) > 1:
                 model.add_no_overlap(intervals)
 
+    # ソフトNGグループ: ペアワイズ重複ペナルティ
+    soft_by_ng_day: dict[tuple, list] = {}
+    for entry in ng_soft_entries:
+        key = (entry[0], entry[1])  # (ng_group, day)
+        soft_by_ng_day.setdefault(key, []).append(entry)
+
+    for (ng, d), entries in soft_by_ng_day.items():
+        if len(entries) < 2:
+            continue
+        # ペア数の上限（変数爆発防止）
+        max_pairs = min(len(entries) * (len(entries) - 1) // 2, 200)
+        pair_count = 0
+        for a_idx in range(len(entries)):
+            if pair_count >= max_pairs:
+                break
+            for b_idx_inner in range(a_idx + 1, len(entries)):
+                if pair_count >= max_pairs:
+                    break
+                _, _, pri_a, i_a, k_a, on_a, start_a, end_a, dur_a = entries[a_idx]
+                _, _, pri_b, i_b, k_b, on_b, start_b, end_b, dur_b = entries[b_idx_inner]
+
+                # 両方がこの日に配置された場合のみチェック
+                both_on = model.new_bool_var(f"both_ng_{ng}_{d}_{i_a}_{k_a}_{i_b}_{k_b}")
+                model.AddBoolAnd([on_a, on_b]).OnlyEnforceIf(both_on)
+                model.AddBoolOr([on_a.Not(), on_b.Not()]).OnlyEnforceIf(both_on.Not())
+
+                # 重複なし = a が b の前 OR b が a の前
+                no_overlap_bool = model.new_bool_var(f"no_ovlp_{ng}_{d}_{i_a}_{k_a}_{i_b}_{k_b}")
+                a_before_b = model.new_bool_var(f"ab_{ng}_{d}_{i_a}_{k_a}_{i_b}_{k_b}")
+                b_before_a = model.new_bool_var(f"ba_{ng}_{d}_{i_a}_{k_a}_{i_b}_{k_b}")
+
+                model.Add(end_a <= start_b).OnlyEnforceIf(a_before_b)
+                model.Add(end_b <= start_a).OnlyEnforceIf(b_before_a)
+                model.AddBoolOr([a_before_b, b_before_a]).OnlyEnforceIf(no_overlap_bool)
+
+                # 重複ペナルティ = both_on AND NOT no_overlap
+                violation = model.new_bool_var(f"viol_{ng}_{d}_{i_a}_{k_a}_{i_b}_{k_b}")
+                model.AddBoolAnd([both_on, no_overlap_bool.Not()]).OnlyEnforceIf(violation)
+                model.AddBoolOr([both_on.Not(), no_overlap_bool]).OnlyEnforceIf(violation.Not())
+
+                weight = 1000 if min(pri_a, pri_b) == 1 else 100
+                penalty_vars.append((violation, weight))
+                pair_count += 1
+
     # ================================================================
     # ソフト制約: セッションをなるべく連続日に詰める
     # ================================================================
-    penalty_vars = []
+    span_penalties = []
     for i, les in enumerate(lessons):
         if les.num_sessions < 2:
             continue
@@ -921,10 +1138,15 @@ def build_and_solve_intensive(
         model.add_min_equality(span_min, days_list)
         span = model.new_int_var(0, num_days, f"span_{i}")
         model.Add(span == span_max - span_min)
-        penalty_vars.append(span)
+        span_penalties.append(span)
 
+    # 目的関数: スパンペナルティ + ソフト制約ペナルティ
+    total_penalty = sum(span_penalties)
     if penalty_vars:
-        model.Minimize(sum(penalty_vars))
+        for var, weight in penalty_vars:
+            total_penalty += var * weight
+
+    model.Minimize(total_penalty)
 
     # ================================================================
     # 求解
@@ -980,11 +1202,71 @@ def build_and_solve_intensive(
     result_df.sort_values(["日付index", "校舎", "開始slot", "教室"], inplace=True)
     result_df.reset_index(drop=True, inplace=True)
 
-    obj_val = solver.objective_value if penalty_vars else 0
+    obj_val = solver.objective_value if (span_penalties or penalty_vars) else 0
     print(f"\n[INFO] ステータス: {status_name}")
-    print(f"[INFO] 目的関数値 (セッション日程スパン合計): {obj_val}")
+    print(f"[INFO] 目的関数値: {obj_val}")
 
     return result_df, status_name
+
+
+# ============================================================
+# 講習会モード 段階的求解
+# ============================================================
+def build_and_solve_intensive_phased(
+    rooms: list[Room],
+    teachers: list[IntensiveTeacher],
+    lessons: list[IntensiveLesson],
+    date_list: list,
+    time_limit_sec: float = 60.0,
+):
+    """
+    段階的に制約を緩和しながら求解を試みる。
+
+    Returns:
+        result_df, status, relaxations(list[str])
+    """
+    phase_time = time_limit_sec * 0.4
+
+    # Phase 1: 全制約でソルブ
+    print("[Phase 1] 全制約で求解中...")
+    try:
+        result, status = build_and_solve_intensive(
+            rooms, teachers, lessons, date_list, phase_time
+        )
+        if result is not None:
+            return result, status, []
+    except ValueError:
+        pass  # Phase 2 で再試行
+
+    # Phase 2: NGグループをソフト化
+    print("[Phase 2] NGグループをソフト化して求解中...")
+    try:
+        result, status = build_and_solve_intensive(
+            rooms, teachers, lessons, date_list, phase_time,
+            _force_soft_ng=True
+        )
+        if result is not None:
+            return result, status, ["NGグループ制約を緩和しました（同時間帯の重複を許容）"]
+    except ValueError:
+        pass
+
+    # Phase 3: さらに全日異なる制約もソフト化
+    print("[Phase 3] 全日異なる制約もソフト化して求解中...")
+    remaining_time = time_limit_sec * 0.2
+    try:
+        result, status = build_and_solve_intensive(
+            rooms, teachers, lessons, date_list, remaining_time,
+            _force_soft_ng=True, _force_soft_alldiff=True
+        )
+        if result is not None:
+            return result, status, [
+                "NGグループ制約を緩和しました（同時間帯の重複を許容）",
+                "同一講座の異日配置制約を緩和しました（同日に複数回を許容）",
+            ]
+    except ValueError as e:
+        return None, f"INFEASIBLE ({e})", []
+
+    return None, status, []
 
 
 # ============================================================
@@ -1026,17 +1308,21 @@ def generate_intensive_mock_data():
     lessons = [
         # NGグループA: 物理と数学は同時にできない（同じ生徒が受講）
         IntensiveLesson("L01", "物理講習", "代々木校", "物理", "T01",
-                        24, 25, 5, list(range(21)), "A"),         # 7/20-8/9, 5回
+                        24, 25, 5, list(range(21)), "A",
+                        time_band="15:00-20:00"),                 # 7/20-8/9, 5回, 15:00-20:00制限
         IntensiveLesson("L02", "数学講習", "代々木校", "数学", "T02",
-                        36, 20, 8, list(range(5, 15)), "A"),      # 7/25-8/3, 8回
+                        36, 20, 8, list(range(5, 15)), "A",
+                        ng_group_priority=1),                     # 7/25-8/3, 8回, NGソフト
         # NGグループB: 英語と国語は同時にできない
         IntensiveLesson("L03", "英語講習", "代々木校", "英語", "T03",
                         18, 15, 10, list(range(num_days)), "B"),  # 全期間, 10回
         IntensiveLesson("L04", "国語講習", "代々木校", "国語", "T04",
-                        18, 10, 6, list(range(20)), "B"),         # 7/20-8/8, 6回
+                        18, 10, 6, list(range(20)), "B",
+                        ng_group_priority=1),                     # 7/20-8/8, 6回, NGソフト
         # NGグループなし
         IntensiveLesson("L05", "化学特別講習", "代々木校", "化学", "T01",
-                        18, 8, 3, list(range(21, num_days)), ""), # 8/10-8/30, 3回
+                        18, 8, 3, list(range(21, num_days)), "",
+                        time_band="10:00-17:00"),                 # 8/10-8/30, 3回, 10:00-17:00制限
     ]
 
     return rooms, teachers, lessons, date_list
